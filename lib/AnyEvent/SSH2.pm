@@ -17,7 +17,7 @@ use Scalar::Util qw(blessed weaken);
 use Carp qw( croak );
 
 use base qw( Net::SSH::Perl );
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use Errno qw( EAGAIN EWOULDBLOCK );
 use vars qw( $VERSION $CONFIG $HOSTNAME @PROPOSAL );
@@ -602,8 +602,6 @@ sub _login {
                 #    $channel->request("shell", 0);
                 #}
 
-                $ssh->emit('_cmd');
-                $ssh->emit('_shell');
                 $ssh->client_loop;
             });
         });
@@ -615,9 +613,8 @@ sub emit {
 
   if (my $s = $self->{events}{$name}) {
     $self->debug("-- Emit $name in @{[blessed $self]} (@{[scalar @$s]})\n");
-    for my $arg (@$s) { 
-        $self->$name(@$arg) 
-    }
+    my $arg = shift @$s;
+    $self->$name(@$arg);
   }
   else {
     $self->debug("-- Emit $name in @{[blessed $self]} (0)\n");
@@ -660,13 +657,67 @@ sub _make_input_channel_req {
 
 sub on { push @{$_[0]->{events}{$_[1]}}, [$_[-2], $_[-1]] }
 
-sub cmd {
+sub send {
     my ($ssh, $cmd, $cb) = @_;
-    $ssh->on(_cmd => $cmd => $cb);
+    $ssh->on(cmd => $cmd => $cb);
     $ssh;
 }
 
-sub _cmd {
+
+#sub shell {
+#    my $ssh = shift;
+#    my $cb  = shift;
+#    $ssh->on(_shell => '');
+#    $ssh->on(on_fininsh => $cb);
+#    $ssh;
+#}
+#
+#sub _shell {
+#    my $ssh = shift;
+#    my $cmgr = $ssh->channel_mgr;
+#    my $channel = $ssh->_session_channel;
+#    $channel->open;
+#
+#    $channel->register_handler(SSH2_MSG_CHANNEL_OPEN_CONFIRMATION, sub {
+#        my($channel, $packet) = @_;
+#        my $r_packet = $channel->request_start('pty-req', 0);
+#        my($term) = $ENV{TERM} =~ /(\S+)/;
+#        $r_packet->put_str($term);
+#        my $foundsize = 0;
+#        if (eval "require Term::ReadKey") {
+#            my @sz = Term::ReadKey::GetTerminalSize($ssh->sock);
+#            if (defined $sz[0]) {
+#                $foundsize = 1;
+#                $r_packet->put_int32($sz[1]); # height
+#                $r_packet->put_int32($sz[0]); # width
+#                $r_packet->put_int32($sz[2]); # xpix
+#                $r_packet->put_int32($sz[3]); # ypix
+#            }
+#        }
+#        if (!$foundsize) {
+#            $r_packet->put_int32(0) for 1..4;
+#        }
+#        $r_packet->put_str("");
+#        $r_packet->send;
+#        $channel->{ssh}->debug("Requesting shell.");
+#        $channel->request("shell", 0);
+#    });
+#
+#    my($exit);
+#    $channel->register_handler(SSH2_MSG_CHANNEL_REQUEST,
+#        _make_input_channel_req(\$exit));
+#
+#    $channel->register_handler("_output_buffer", sub {
+#        syswrite STDOUT, $_[1]->bytes;
+#    });
+#    $channel->register_handler("_extended_buffer", sub {
+#        syswrite STDERR, $_[1]->bytes;
+#    });
+#
+#    $ssh->debug("Entering interactive session.");
+#}
+
+sub cmd {
     my $ssh = shift;
     my($cmd, $cb) = @_;
 
@@ -752,63 +803,10 @@ sub _cmd {
 
     $ssh->debug("Entering interactive session.");
     $channel->{cb} = sub {
-        my $ssh = shift;
         $cb->($ssh, $stdout, $stderr);
     }
     
 }
-sub shell {
-    my $ssh = shift;
-    my $cb  = shift;
-    $ssh->on(_shell => '');
-    $ssh->on(on_fininsh => $cb);
-    $ssh;
-}
-sub _shell {
-    my $ssh = shift;
-    my $cmgr = $ssh->channel_mgr;
-    my $channel = $ssh->_session_channel;
-    $channel->open;
-
-    $channel->register_handler(SSH2_MSG_CHANNEL_OPEN_CONFIRMATION, sub {
-        my($channel, $packet) = @_;
-        my $r_packet = $channel->request_start('pty-req', 0);
-        my($term) = $ENV{TERM} =~ /(\S+)/;
-        $r_packet->put_str($term);
-        my $foundsize = 0;
-        if (eval "require Term::ReadKey") {
-            my @sz = Term::ReadKey::GetTerminalSize($ssh->sock);
-            if (defined $sz[0]) {
-                $foundsize = 1;
-                $r_packet->put_int32($sz[1]); # height
-                $r_packet->put_int32($sz[0]); # width
-                $r_packet->put_int32($sz[2]); # xpix
-                $r_packet->put_int32($sz[3]); # ypix
-            }
-        }
-        if (!$foundsize) {
-            $r_packet->put_int32(0) for 1..4;
-        }
-        $r_packet->put_str("");
-        $r_packet->send;
-        $channel->{ssh}->debug("Requesting shell.");
-        $channel->request("shell", 0);
-    });
-
-    my($exit);
-    $channel->register_handler(SSH2_MSG_CHANNEL_REQUEST,
-        _make_input_channel_req(\$exit));
-
-    $channel->register_handler("_output_buffer", sub {
-        syswrite STDOUT, $_[1]->bytes;
-    });
-    $channel->register_handler("_extended_buffer", sub {
-        syswrite STDERR, $_[1]->bytes;
-    });
-
-    $ssh->debug("Entering interactive session.");
-}
-
 
 sub break_client_loop { $_[0]->{ek_client_loopcl_quit_pending} = 1 }
 sub restore_client_loop { $_[0]->{_cl_quit_pending} = 0 }
@@ -816,15 +814,21 @@ sub _quit_pending { $_[0]->{_cl_quit_pending} }
 
 sub client_loop {
     my $ssh = shift;
+    return unless scalar @{$ssh->{events}{cmd}} > 0;
+    $ssh->emit('cmd');
     $ssh->{_cl_quit_pending} = 0;
+
+    # 取所有频道
     my $cmgr = $ssh->channel_mgr;
+    
+    # 处理每个频道的事件
     my $h = $cmgr->handlers;
-    $ssh->event($cmgr, $h);
+    $ssh->event_loop($cmgr, $h);
 }
 
-sub event {
+sub event_loop {
     my ($ssh, $cmgr, $h, $cb) = @_;
-    return $ssh->emit('on_finish') if $ssh->_quit_pending;
+    return $ssh->client_loop if $ssh->_quit_pending;
     while (my $packet = Net::SSH::Perl::Packet->read_poll($ssh)) {
         if (my $code = $h->{ $packet->type }) {
             $code->($cmgr, $packet);
@@ -834,7 +838,7 @@ sub event {
         }
     }
 
-    return $ssh->emit('on_finish') if $ssh->_quit_pending;
+    return $ssh->client_loop if $ssh->_quit_pending;
 
     $cmgr->process_output_packets;
 
@@ -857,12 +861,12 @@ sub event {
     }
         
     my $oc = grep { defined } @{ $cmgr->{channels} };
-    return $ssh->emit('on_finish') unless $oc > 1;
+    return $ssh->client_loop unless $oc > 1;
 
     my $cv = AE::cv sub {
         my $result = shift->recv;
         delete $ssh->{watcher};
-        $ssh->event($cmgr, $h, $cb);
+        $ssh->event_loop($cmgr, $h, $cb);
     };
 
     # 这是处理频道上的输出, 客户端的输入
@@ -971,11 +975,11 @@ __END__
 
 =head1 NAME
 
-AnyEvent::SSH2 - 基于 AnyEvent 的 SSH2 的事件驱动的实现
+AnyEvent::SSH2 - 基于 AnyEvent 的 SSH2 的非阻塞事件驱动的实现
 
 =head1 SYNOPSIS
 
-对多个主机, 并行的远程执行一些命令.
+对多台主机, 并行的远程执行一些命令.
 
     use AE;
     use AnyEvent::SSH2;
@@ -995,14 +999,14 @@ AnyEvent::SSH2 - 基于 AnyEvent 的 SSH2 的事件驱动的实现
     my $cv = AE::cv;
 
     $cv->begin;
-    $ssh1->cmd('sleep 5;hostname' => sub {
+    $ssh1->send('sleep 5;hostname' => sub {
         my ($ssh,  $stdout, $stderr) = @_;
         print "$stdout";
         $cv->end;
     })->connect;  
     
     $cv->begin;
-    $ssh2->cmd('sleep 1;hostname' => sub {
+    $ssh2->send('sleep 1;hostname' => sub {
         my ($ssh,  $stdout, $stderr) = @_;
         print "$stdout";
         $cv->end;
@@ -1022,14 +1026,14 @@ AnyEvent::SSH2 - 基于 AnyEvent 的 SSH2 的事件驱动的实现
     
     my $cv = AE::cv;
     $cv->begin;
-    $ssh->cmd('sleep 5; echo 5' => sub {
+    $ssh->send('sleep 5; echo 5' => sub {
         my ($ssh,  $stdout, $stderr) = @_;
         print "$stdout";
         $cv->end;
     });
     
     $cv->begin;
-    $ssh->cmd('sleep 1; echo 1 ; uptime' => sub {
+    $ssh->send('sleep 1; echo 1 ; uptime' => sub {
         my ($ssh,  $stdout, $stderr) = @_;
         print "$stdout";
         $cv->end;
@@ -1039,12 +1043,27 @@ AnyEvent::SSH2 - 基于 AnyEvent 的 SSH2 的事件驱动的实现
     
     $cv->recv;
 
+或者你可能想有一定层次, 根据前一条命令的条件来执行指定的命令.
+
+    my $cv = AE::cv;
+    $ssh->send('sleep 5; echo 5' => sub {
+        my ($ssh,  $stdout, $stderr) = @_;
+        print "$stdout";
+        $ssh->send('sleep 1; echo 1 ; uptime' => sub {
+            my ($ssh,  $stdout, $stderr) = @_;
+            print "$stdout";
+            $cv->send;
+        });
+    });
+    
+    $ssh->connect;  
+    
+    $cv->recv;
 
 =head1 DESCRIPTION
 
-这个模块是基于 Net::SSH::Perl 实现的在 AnyEvent 上的事件驱动的支持. 没有使用 Fork 的实现, 这是基于 sock 的原生实现. 
-可以同时异步的连接多个主机进行操作. 
-并且也可以支持同时对一个主机同时执行多条命令.
+这个模块是基于 Net::SSH::Perl 实现的在 AnyEvent 上的事件驱动的支持. 并不是使用的 Fork 的实现 (non-fork), 这是基于 socket 的原生事件驱动实现. 
+可以同时异步的连接多个主机进行操作.  并且也可以支持同时对一个主机同时执行多条命令与根据前面结果然后在执行指定命令.
 
 =head1 属性
 
@@ -1068,7 +1087,7 @@ AnyEvent::SSH2 - 基于 AnyEvent 的 SSH2 的事件驱动的实现
 
 本对象所支持的方法如下
 
-=head2 cmd
+=head2 send
 
 这个需要提供你要给远程执行的命令做为第一个参数, 第二个参数是命令执行完的回调函数. 
 回调函数的第二个和第三个参数会别会是命令执行的标准输出和标准错误.
